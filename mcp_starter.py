@@ -1,4 +1,11 @@
 import logging
+logging.basicConfig(
+    filename='mcp_tool.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
+
+
 import asyncio
 from typing import Annotated
 import os
@@ -7,23 +14,17 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
 from mcp import ErrorData, McpError
 from mcp.server.auth.provider import AccessToken
-from mcp.types import TextContent, INTERNAL_ERROR
+from mcp.types import TextContent, INVALID_PARAMS, INTERNAL_ERROR
 from pydantic import BaseModel, Field
+
 import markdownify
 import httpx
 import readabilipy
 import json
-import re
-
-# --- Setup logging ---
-logging.basicConfig(
-    filename='mcp_tool.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-)
 
 # --- Load environment variables ---
 load_dotenv()
+
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
@@ -50,8 +51,58 @@ class RichToolDescription(BaseModel):
     use_when: str
     side_effects: str | None = None
 
+# --- Fetch Utility Class ---
+class Fetch:
+    USER_AGENT = "Puch/1.0 (Autonomous)"
+
+    @classmethod
+    async def fetch_url(cls, url: str, user_agent: str, force_raw: bool = False) -> tuple[str, str]:
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, follow_redirects=True, headers={"User-Agent": user_agent}, timeout=30)
+            except httpx.HTTPError as e:
+                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
+
+            if response.status_code >= 400:
+                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url} - status code {response.status_code}"))
+
+            page_raw = response.text
+
+        content_type = response.headers.get("content-type", "")
+        is_page_html = "text/html" in content_type
+
+        if is_page_html and not force_raw:
+            return cls.extract_content_from_html(page_raw), ""
+        return (page_raw, f"Content type {content_type} cannot be simplified to markdown, but here is the raw content:\n")
+
+    @staticmethod
+    def extract_content_from_html(html: str) -> str:
+        ret = readabilipy.simple_json.simple_json_from_html_string(html, use_readability=True)
+        if not ret or not ret.get("content"):
+            return "<error>Page failed to be simplified from HTML</error>"
+        return markdownify.markdownify(ret["content"], heading_style=markdownify.ATX)
+
+    @staticmethod
+    async def google_search_links(query: str, num_results: int = 5) -> list[str]:
+        ddg_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
+        links = []
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(ddg_url, headers={"User-Agent": Fetch.USER_AGENT})
+            if resp.status_code != 200:
+                return ["<error>Failed to perform search.</error>"]
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", class_="result__a", href=True):
+            href = a["href"]
+            if "http" in href:
+                links.append(href)
+            if len(links) >= num_results:
+                break
+        return links or ["<error>No results found.</error>"]
+
 # --- MCP Server Setup ---
-mcp = FastMCP("Tech Translator MCP Server", auth=SimpleBearerAuthProvider(TOKEN))
+mcp = FastMCP("Job Finder MCP Server", auth=SimpleBearerAuthProvider(TOKEN))
 
 # --- Tool: validate (required by Puch) ---
 @mcp.tool
@@ -70,7 +121,6 @@ async def tech_translator(
 ) -> list[TextContent]:
     try:
         logging.info(f"tech_translator input: {tech_text}")
-
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -81,13 +131,7 @@ async def tech_translator(
                 data=json.dumps({
                     "model": "openai/gpt-oss-20b:free",
                     "messages": [
-                        {"role": "system", "content": (
-                            "You are a tech explainer. For any input, output four sections:\n"
-                            "1. 📖 Plain English:\n"
-                            "2. 🔹 TL;DR:\n"
-                            "3. 🍼 ELI5:\n"
-                            "4. 📊 Visual (text diagram)."
-                        )},
+                        {"role": "system", "content": "You are a tech explainer. For any input, output four sections:\n1. 📖 Plain English:\n2. 🔹 TL;DR:\n3. 🍼 ELI5:\n4. 📊 Visual (text diagram)."},
                         {"role": "user", "content": tech_text}
                     ],
                     "temperature": 0.7
@@ -99,27 +143,14 @@ async def tech_translator(
 
         api_data = response.json()
         explanation = api_data["choices"][0]["message"]["content"]
-
+        
         logging.info(f"tech_translator output: {explanation}")
+        return [TextContent(type="text", text=explanation)]
 
-        # Split explanation into sections by numbers followed by a dot and whitespace
-        parts = re.split(r'\n?\d+\.\s+', explanation)
-        if parts and parts[0].strip() == "":
-            parts = parts[1:]  # Remove empty first split if present
 
-        titles = ["📖 Plain English:", "🔹 TL;DR:", "🍼 ELI5:", "📊 Visual (text diagram):"]
-        texts = []
-
-        for i, part in enumerate(parts):
-            text = part.strip()
-            if text:
-                content = f"{titles[i]}\n{text}"
-                texts.append(TextContent(type="text", text=content))
-
-        return texts
+        return [TextContent(type="text", text=explanation)]
 
     except Exception as e:
-        logging.error(f"tech_translator error: {e}", exc_info=True)
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
 
 # --- Run MCP Server ---
